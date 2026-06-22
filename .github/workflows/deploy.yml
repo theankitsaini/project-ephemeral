@@ -1,0 +1,116 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+# Define reusable environment variables
+env:
+  AWS_REGION: "eu-west-1"
+  ECR_REPOSITORY: "amsterdam-bike-api"
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    # Export the registry URL so the deploy job can use it dynamically
+    outputs:
+      registry: ${{ steps.login-ecr.outputs.registry }}
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Log in to AWS ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build Docker Image
+      run: |
+        docker build -t ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest .
+
+    - name: Run Trivy Vulnerability Scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        format: 'table'
+        exit-code: '1' # Fails the build if critical vulnerabilities are found
+        ignore-unfixed: true
+        vuln-type: 'os,library'
+        severity: 'CRITICAL'
+
+    - name: Push Image to AWS ECR
+      if: success()
+      run: |
+        docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  deploy:
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy to K3s via SSH
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ubuntu
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          # 1. Temporarily authenticate the EC2 server to pull the private Docker image
+          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          export AWS_DEFAULT_REGION=${{ env.AWS_REGION }}
+          
+          # Install AWS CLI if it's not present (required for ECR login)
+          if ! command -v aws &> /dev/null; then
+              sudo apt-get update && sudo apt-get install -y awscli
+          fi
+          
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ needs.build-and-scan.outputs.registry }}
+          
+          # 2. Write the Kubernetes deployment manifest
+          cat <<EOF > deployment.yaml
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: bike-api
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: bike-api
+            template:
+              metadata:
+                labels:
+                  app: bike-api
+              spec:
+                containers:
+                - name: bike-api
+                  image: ${{ needs.build-and-scan.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+                  ports:
+                  - containerPort: 8000
+                  imagePullPolicy: Always
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: bike-api-service
+          spec:
+            type: NodePort
+            selector:
+              app: bike-api
+            ports:
+            - port: 8000
+              targetPort: 8000
+              nodePort: 30080
+          EOF
+          
+          # 3. Apply the deployment to the K3s cluster
+          sudo kubectl apply -f deployment.yaml
+          
+          # 4. Force a rollout restart to ensure the newest image is pulled
+          sudo kubectl rollout restart deployment/bike-api
