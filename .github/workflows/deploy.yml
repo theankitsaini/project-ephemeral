@@ -53,24 +53,36 @@ jobs:
     needs: build-and-scan
     runs-on: ubuntu-latest
     steps:
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Generate ECR Password
+      id: ecr
+      run: |
+        echo "password=$(aws ecr get-login-password --region ${{ env.AWS_REGION }})" >> $GITHUB_OUTPUT
+
     - name: Deploy to K3s via SSH
       uses: appleboy/ssh-action@master
+      env:
+        ECR_PASSWORD: ${{ steps.ecr.outputs.password }}
+        REGISTRY: ${{ needs.build-and-scan.outputs.registry }}
+        REPO: ${{ env.ECR_REPOSITORY }}
       with:
         host: ${{ secrets.EC2_HOST }}
         username: ubuntu
         key: ${{ secrets.EC2_SSH_KEY }}
+        envs: ECR_PASSWORD,REGISTRY,REPO
         script: |
-          # 1. Temporarily authenticate the EC2 server to pull the private Docker image
-          export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
-          export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          export AWS_DEFAULT_REGION=${{ env.AWS_REGION }}
-          
-          # Install AWS CLI if it's not present (required for ECR login)
-          if ! command -v aws &> /dev/null; then
-              sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y awscli
-          fi
-          
-          aws ecr get-login-password --region ${{ env.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ needs.build-and-scan.outputs.registry }}
+          # 1. Feed the GitHub-generated ECR password directly to K3s securely
+          sudo kubectl create secret docker-registry ecr-secret \
+            --docker-server=$REGISTRY \
+            --docker-username=AWS \
+            --docker-password=$ECR_PASSWORD \
+            --dry-run=client -o yaml | sudo kubectl apply -f -
           
           # 2. Write the Kubernetes deployment manifest
           cat <<EOF > deployment.yaml
@@ -88,9 +100,11 @@ jobs:
                 labels:
                   app: bike-api
               spec:
+                imagePullSecrets:
+                - name: ecr-secret
                 containers:
                 - name: bike-api
-                  image: ${{ needs.build-and-scan.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+                  image: $REGISTRY/$REPO:latest
                   ports:
                   - containerPort: 8000
                   imagePullPolicy: Always
@@ -109,8 +123,6 @@ jobs:
               nodePort: 30080
           EOF
           
-          # 3. Apply the deployment to the K3s cluster
+          # 3. Apply the deployment and force restart
           sudo kubectl apply -f deployment.yaml
-          
-          # 4. Force a rollout restart to ensure the newest image is pulled
           sudo kubectl rollout restart deployment/bike-api
