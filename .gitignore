@@ -1,0 +1,8 @@
+# Ignore Terraform plugins and local files
+.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.tfstate.lock.info
+
+# Ignore the zipped Lambda function
+*.zip
